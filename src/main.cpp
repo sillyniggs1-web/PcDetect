@@ -54,23 +54,14 @@ bool patchString(uintptr_t base, uintptr_t length, const char* source, const cha
         if (*reinterpret_cast<const uint8_t*>(addr + sourceLen) != 0)
             continue;
 
-        // Keep the original allocation and terminate the replacement with NULs.
-        std::initializer_list<uint8_t> bytes = {
-            replacementLen > 0 ? static_cast<uint8_t>(replacement[0]) : 0,
-            replacementLen > 1 ? static_cast<uint8_t>(replacement[1]) : 0,
-            replacementLen > 2 ? static_cast<uint8_t>(replacement[2]) : 0,
-            replacementLen > 3 ? static_cast<uint8_t>(replacement[3]) : 0,
-            replacementLen > 4 ? static_cast<uint8_t>(replacement[4]) : 0,
-            replacementLen > 5 ? static_cast<uint8_t>(replacement[5]) : 0,
-            replacementLen > 6 ? static_cast<uint8_t>(replacement[6]) : 0,
-            replacementLen > 7 ? static_cast<uint8_t>(replacement[7]) : 0,
-            0
-        };
+        // Keep the original allocation: copy the replacement and pad with NULs
+        // so the whole original literal (including its terminator) is overwritten.
+        uint8_t bytes[64] = {0};
+        if (sourceLen + 1 > sizeof(bytes)) return false;
+        std::memcpy(bytes, replacement, replacementLen);
 
-        if (!aml->PatchMemory(addr, bytes)) {
-            log("[MobiladorID] PatchMemory failed at +0x%lX", static_cast<unsigned long>(off));
-            return false;
-        }
+        aml->Unprot(addr, sourceLen + 1);
+        aml->Write(addr, reinterpret_cast<uintptr_t>(bytes), sourceLen + 1);
 
         log("[MobiladorID] %s -> %s in image +0x%lX",
             source, replacement, static_cast<unsigned long>(off));
