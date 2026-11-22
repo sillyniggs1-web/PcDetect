@@ -13,4 +13,4 @@ add_library(MobiladorID SHARED
 target_include_directories(MobiladorID PRIVATE third_party/aml)
 target_compile_options(MobiladorID PRIVATE -ffunction-sections -fdata-sections)
 target_link_libraries(MobiladorID PRIVATE log dl)
-target_link_options(MobiladorID PRIVATE -Wl,--gc-sections)
+target_link_options(MobiladorID PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -s)
