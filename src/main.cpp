@@ -11,9 +11,11 @@
 #include <thread>
 #include <initializer_list>
 #include <cstdarg>
+#include <vector>
+#include <unistd.h>
 
 MYMODCFGNAME(net.hexedstudio.mobiladorid, Mobilador ID, 1.0.0, HEXED Studio, MobiladorID)
-NEEDGAME(com.rockstargames.gtasa)
+NEEDGAME(com.nezukosamp.game)
 
 namespace {
 
@@ -36,9 +38,43 @@ void log(const char* fmt, ...) {
     logger->Info("%s", buf);
 }
 
-bool patchString(uintptr_t base, uintptr_t length, const char* source, const char* replacement) {
-    if (!base || !length || !source || !replacement) return false;
+struct Range { uintptr_t begin; uintptr_t end; bool writable; };
 
+// Only scan pages that are actually mapped and readable. The span returned by
+// GetLibLength() can include unmapped gaps, and reading those would SIGSEGV
+// inside the game process.
+std::vector<Range> readableRanges(const char* lib) {
+    std::vector<Range> out;
+    FILE* f = std::fopen("/proc/self/maps", "r");
+    if (!f) return out;
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (!std::strstr(line, lib)) continue;
+        unsigned long b = 0, e = 0;
+        char perms[8] = {0};
+        if (std::sscanf(line, "%lx-%lx %7s", &b, &e, perms) != 3) continue;
+        if (perms[0] != 'r') continue;
+        out.push_back({static_cast<uintptr_t>(b), static_cast<uintptr_t>(e), perms[1] == 'w'});
+    }
+    std::fclose(f);
+    return out;
+}
+
+// Searches one readable range for `needle\0`. Returns the address or 0.
+uintptr_t findLiteral(const Range& r, const char* needle) {
+    const size_t n = std::strlen(needle);
+    if (r.end <= r.begin || r.end - r.begin < n + 1) return 0;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(r.begin);
+    const size_t span = r.end - r.begin;
+    for (size_t off = 0; off + n + 1 <= span; ++off) {
+        if (p[off] == static_cast<uint8_t>(needle[0]) &&
+            std::memcmp(p + off, needle, n) == 0 && p[off + n] == 0)
+            return r.begin + off;
+    }
+    return 0;
+}
+
+bool patchString(const std::vector<Range>& ranges, const char* source, const char* replacement) {
     const size_t sourceLen = std::strlen(source);
     const size_t replacementLen = std::strlen(replacement);
     if (replacementLen > sourceLen) {
@@ -46,16 +82,11 @@ bool patchString(uintptr_t base, uintptr_t length, const char* source, const cha
         return false;
     }
 
-    // Search the mapped image instead of relying on a fixed RVA.
-    for (uintptr_t off = 0; off + sourceLen + 1 <= length; ++off) {
-        const uintptr_t addr = base + off;
-        if (std::memcmp(reinterpret_cast<const void*>(addr), source, sourceLen) != 0)
-            continue;
-        if (*reinterpret_cast<const uint8_t*>(addr + sourceLen) != 0)
-            continue;
+    for (const Range& r : ranges) {
+        const uintptr_t addr = findLiteral(r, source);
+        if (!addr) continue;
 
-        // Keep the original allocation: copy the replacement and pad with NULs
-        // so the whole original literal (including its terminator) is overwritten.
+        // Copy the replacement and pad with NULs over the whole original literal.
         uint8_t bytes[64] = {0};
         if (sourceLen + 1 > sizeof(bytes)) return false;
         std::memcpy(bytes, replacement, replacementLen);
@@ -63,30 +94,24 @@ bool patchString(uintptr_t base, uintptr_t length, const char* source, const cha
         aml->Unprot(addr, sourceLen + 1);
         aml->Write(addr, reinterpret_cast<uintptr_t>(bytes), sourceLen + 1);
 
-        log("[MobiladorID] %s -> %s in image +0x%lX",
-            source, replacement, static_cast<unsigned long>(off));
+        log("[MobiladorID] %s -> %s at %p", source, replacement, reinterpret_cast<void*>(addr));
         return true;
     }
-
     return false;
 }
 
 bool tryPatch(const char* reported) {
     for (const char* lib : kLibs) {
-        const uintptr_t base = aml->GetLib(lib);
-        const uintptr_t length = aml->GetLibLength(lib);
-        if (!base || !length) continue;
+        if (!aml->GetLib(lib)) continue;              // not loaded yet
+        const std::vector<Range> ranges = readableRanges(lib);
+        if (ranges.empty()) continue;
 
-        if (patchString(base, length, kSource, reported)) {
+        if (patchString(ranges, kSource, reported)) {
             log("[MobiladorID] patched %s", lib);
             return true;
         }
-
-        // If the target already contains the desired identifier, treat it as success.
-        const size_t len = std::strlen(reported);
-        for (uintptr_t off = 0; off + len + 1 <= length; ++off) {
-            if (std::memcmp(reinterpret_cast<const void*>(base + off), reported, len) == 0 &&
-                *reinterpret_cast<const uint8_t*>(base + off + len) == 0) {
+        for (const Range& r : ranges) {
+            if (findLiteral(r, reported)) {
                 log("[MobiladorID] %s already contains %s", lib, reported);
                 return true;
             }
